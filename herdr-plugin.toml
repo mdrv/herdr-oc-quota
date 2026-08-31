@@ -1,0 +1,18 @@
+id = "herdr-oc-quota"
+name = "GLM / Z.AI Coding Plan Quota"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "GLM / Z.AI Coding Plan quota indicator shown in the Herdr tab bar (top or bottom). Reads the API key from OpenCode's auth store; works without OpenCode running."
+platforms = ["linux"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[startup]]
+title = "Refresh GLM quota"
+command = ["/bin/sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-oc-quota\" refresh"]
+
+[[actions]]
+id = "refresh"
+title = "GLM quota: refresh now"
+command = ["/bin/sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-oc-quota\" refresh --force"]
