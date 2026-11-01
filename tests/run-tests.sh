@@ -18,6 +18,10 @@ cat > "$T/auth.json" <<'EOF'
 {"zai-coding-plan": {"key": "mock-key-not-real"}}
 EOF
 
+# OpenCode v2 credential DB: default to an absent path so the tests below
+# exercise the auth.json fallback hermetically (section 8b+ overrides it).
+export HERDR_OC_QUOTA_AUTH_DB="$T/absent-opencode.db"
+
 # ---------- mock API server ----------
 cat > "$T/server.py" <<'EOF'
 import http.server, json, time
@@ -45,6 +49,12 @@ class H(http.server.BaseHTTPRequestHandler):
             self.reply(200, {"code": 1002, "msg": "request too fast"})
         elif self.path == '/500':
             self.send_response(500); self.end_headers(); self.wfile.write(b'boom')
+        elif self.path.startswith('/expect/'):
+            # success ONLY when the Authorization header equals the path key
+            if auth == self.path[len('/expect/'):]:
+                self.reply(200, quota_body())
+            else:
+                self.send_response(500); self.end_headers()
         elif self.path == '/checkauth':
             # success ONLY for a raw (non-Bearer), non-empty key
             if auth and not auth.startswith('Bearer '):
@@ -117,7 +127,7 @@ fresh_dirs
 OUT6=$(HERDR_OC_QUOTA_API_URL=http://127.0.0.1:8931/ok HERDR_OC_QUOTA_AUTH_PATH="$T/nope.json" \
     HERDR_OC_QUOTA_CONFIG="$T/cfg/config.toml" HERDR_OC_QUOTA_STATE_DIR="$T/state" "$BIN" refresh --force \
     | fl)
-check "missing auth" "GLM ✖ cannot read OpenCode auth.json (log in via opencode once)" "$OUT6"
+check "missing auth" "GLM ✖ no Z.AI credential in OpenCode (log in via opencode once)" "$OUT6"
 
 # 7. state exists but percentage null and no error -> ellipsis, no fetch
 fresh_dirs
@@ -133,6 +143,94 @@ check "null-data ellipsis" "GLM …" "$OUT7"
 fresh_dirs
 OUT8=$(run http://127.0.0.1:8931/checkauth refresh --force)
 case "$OUT8" in "GLM 42%"*" ago") ok "auth header raw (no Bearer)" ;; *) bad "auth header: [$OUT8]" ;; esac
+
+# 8b. credential DB (OpenCode v2): db key wins over auth.json
+cat > "$T/mkdb.py" <<'EOF'
+import json, os, sqlite3, sys
+# mkdb.py DB_PATH (integration active value time_updated)xN — value is a
+# bare key or a JSON blob; active is 'null' or an int
+path, rows = sys.argv[1], sys.argv[2:]
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+db = sqlite3.connect(path)
+db.execute("""CREATE TABLE credential (
+    id text PRIMARY KEY, integration_id text, label text NOT NULL,
+    value text NOT NULL, connector_id text, method_id text, active integer,
+    time_created integer NOT NULL, time_updated integer NOT NULL)""")
+for i in range(0, len(rows), 4):
+    integ, active, value, updated = rows[i:i + 4]
+    if not value.startswith('{'):
+        value = json.dumps({"type": "key", "key": value})
+    db.execute("INSERT INTO credential VALUES (?,?,?,?,?,?,?,?,?)",
+               (f"id{i}", integ, "API key", value, None, None,
+                None if active == "null" else int(active), 1700000000, int(updated)))
+db.commit()
+db.close()
+EOF
+dbexpect() { # db expected_key args... → fetch must send the expected key
+    _db=$1; _key=$2; shift 2
+    HERDR_OC_QUOTA_API_URL="http://127.0.0.1:8931/expect/$_key" \
+    HERDR_OC_QUOTA_AUTH_DB="$_db" HERDR_OC_QUOTA_AUTH_PATH="$T/auth.json" \
+    HERDR_OC_QUOTA_CONFIG="$T/cfg/config.toml" HERDR_OC_QUOTA_STATE_DIR="$T/state" \
+    "$BIN" "$@" | fl
+}
+fresh_dirs
+python3 "$T/mkdb.py" "$T/db/a.db" zai-coding-plan 1 db-key-1 1700000001
+OUTDB=$(dbexpect "$T/db/a.db" db-key-1 refresh --force)
+case "$OUTDB" in "GLM 42%"*) ok "db key wins over auth.json" ;; *) bad "db key: [$OUTDB]" ;; esac
+
+# 8c. db without a matching row -> auth.json fallback
+python3 "$T/mkdb.py" "$T/db/b.db" other-provider 1 other-key 1700000001
+OUTDB2=$(dbexpect "$T/db/b.db" mock-key-not-real refresh --force)
+case "$OUTDB2" in "GLM 42%"*) ok "no db row -> auth.json fallback" ;; *) bad "db fallback: [$OUTDB2]" ;; esac
+
+# 8d. `active = 0` rows ignored; NULL active (legacy import) used
+python3 "$T/mkdb.py" "$T/db/c.db" zai-coding-plan 0 stale-key 1700000009 \
+    zai-coding-plan null live-key 1700000001
+OUTDB3=$(dbexpect "$T/db/c.db" live-key refresh --force)
+case "$OUTDB3" in "GLM 42%"*) ok "active=0 ignored, NULL active used" ;; *) bad "active filter: [$OUTDB3]" ;; esac
+
+# 8e. zai-coding-sleev alias accepted
+python3 "$T/mkdb.py" "$T/db/d.db" zai-coding-sleev 1 sleev-key 1700000001
+OUTDB4=$(dbexpect "$T/db/d.db" sleev-key refresh --force)
+case "$OUTDB4" in "GLM 42%"*) ok "zai-coding-sleev alias accepted" ;; *) bad "sleev alias: [$OUTDB4]" ;; esac
+
+# 8f. oauth-shaped credential value (access token)
+python3 "$T/mkdb.py" "$T/db/e.db" zai-coding-plan 1 \
+    '{"type":"oauth","access":"oauth-tok-1","refresh":"r1"}' 1700000001
+OUTDB5=$(dbexpect "$T/db/e.db" oauth-tok-1 refresh --force)
+case "$OUTDB5" in "GLM 42%"*) ok "oauth credential value used" ;; *) bad "oauth value: [$OUTDB5]" ;; esac
+
+# 8g. rows still in the WAL are visible (autocheckpoint off, writer holds conn)
+cat > "$T/waltest.py" <<'EOF'
+import json, os, sqlite3, subprocess, sys
+t, bin_path = sys.argv[1], sys.argv[2]
+db_path = os.path.join(t, "wal.db")
+db = sqlite3.connect(db_path)
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA wal_autocheckpoint=0")
+db.execute("""CREATE TABLE credential (
+    id text PRIMARY KEY, integration_id text, label text NOT NULL,
+    value text NOT NULL, connector_id text, method_id text, active integer,
+    time_created integer NOT NULL, time_updated integer NOT NULL)""")
+db.execute("INSERT INTO credential VALUES ('w1','zai-coding-plan','API key',?,NULL,NULL,1,1700000000,1700000005)",
+           (json.dumps({"type": "key", "key": "wal-key-1"}),))
+db.commit()  # stays in the WAL: no checkpoint, writer connection held open
+env = dict(os.environ,
+           HERDR_OC_QUOTA_API_URL="http://127.0.0.1:8931/expect/wal-key-1",
+           HERDR_OC_QUOTA_AUTH_DB=db_path,
+           HERDR_OC_QUOTA_AUTH_PATH=os.path.join(t, "auth.json"),
+           HERDR_OC_QUOTA_CONFIG=os.path.join(t, "cfg/config.toml"),
+           HERDR_OC_QUOTA_STATE_DIR=os.path.join(t, "state"))
+subprocess.run(["rm", "-rf", os.path.join(t, "state")])
+os.makedirs(os.path.join(t, "state"))
+out = subprocess.run([bin_path, "refresh", "--force"], env=env,
+                     capture_output=True, text=True).stdout
+db.close()
+print("ok" if out.startswith("GLM 42%") else "FAIL:" + out.strip())
+EOF
+fresh_dirs
+WALOUT=$(python3 "$T/waltest.py" "$T" "$BIN")
+check "unread WAL row visible" "ok" "$WALOUT"
 
 # 9. config: show_reset/show_age off, label
 fresh_dirs

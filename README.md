@@ -20,9 +20,11 @@ not tied to any pane or agent sidebar item.
 └──────────────────────────────────────────────────────────┘
 ```
 
-- Reads the Z.AI key from OpenCode's auth store
-  (`~/.local/share/opencode/auth.json`, provider `zai-coding-plan`).
-  **OpenCode does not need to be running** — the key is only stored there.
+- Reads the Z.AI key from OpenCode's credential store — the v2 credential DB
+  (`~/.local/share/opencode/opencode.db`, read-only, WAL-safe) first, legacy
+  `auth.json` as fallback (provider `zai-coding-plan`).
+  **OpenCode does not need to be running** — and a running server is fine
+  too (WAL readers never block the writer).
 - Talks to the same endpoint `oc-quota` uses
   (`https://api.z.ai/api/monitor/usage/quota/limit`), so no `oc-quota`/bun
   dependency at runtime.
@@ -139,7 +141,8 @@ show_reset = true # show the quota reset
 reset_style = "clock" # "clock" = ⏰ HH:mm:ss local time of reset; "duration" = e.g. 1d12h
 show_age = true # "· 3m ago" since last successful fetch
 right_margin = "⠀" # trailing margin; U+2800 braille blank by default ("" disables)
-# auth_json_path = "/…/auth.json"  # if your OpenCode auth store lives elsewhere
+# auth_db_path = "/…/opencode.db"  # if OpenCode's credential DB lives elsewhere
+# auth_json_path = "/…/auth.json"  # legacy (< v2) auth store, fallback
 ```
 
 An older install's `~/.config/herdr-oc-quota/config.toml` is still read as a
@@ -147,8 +150,12 @@ fallback and is migrated automatically by `install.sh`.
 
 ## Troubleshooting
 
-- `GLM ✖ cannot read OpenCode auth.json` — log in to Z.AI via OpenCode once
-  (`opencode`), or set `auth_json_path`.
+- `GLM ✖ no Z.AI credential in OpenCode` — log in to Z.AI via OpenCode once
+  (`opencode`), or set `auth_db_path` / `auth_json_path`.
+- `GLM ✖ cannot read opencode.db: …` — the credential DB exists but can't be
+  opened (permissions/corruption); fix it, or point `auth_db_path` at a good
+  copy (the legacy `auth_json_path` is only consulted when the DB has no
+  usable row, not when it can't be read).
 - `GLM ✖ HTTP 401` — the stored key is no longer valid; re-login in OpenCode.
 - Plugin logs: `herdr plugin log list`.
 - The Herdr config must otherwise be valid — `install.sh` refuses to patch if
@@ -159,7 +166,7 @@ fallback and is migrated automatically by `install.sh`.
 `cargo build --release`; binary subcommands `status` / `refresh [--force]`.
 State lives in `~/.local/state/herdr-oc-quota/state.json` (atomic writes,
 `flock` against concurrent tab-bar polls). For testing, the binary honors
-`HERDR_OC_QUOTA_{CONFIG,STATE_DIR,AUTH_PATH,API_URL}` env overrides
+`HERDR_OC_QUOTA_{CONFIG,STATE_DIR,AUTH_DB,AUTH_PATH,API_URL}` env overrides
 (`CONFIG` = path to the toml file) as well as `HERDR_CONFIG_PATH` /
 `XDG_CONFIG_HOME` for config discovery, and `install.sh` / `uninstall.sh`
 accept `--no-link` / `--no-refresh` / `--no-unlink` plus Herdr's

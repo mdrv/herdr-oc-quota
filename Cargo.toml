@@ -1,6 +1,6 @@
 [package]
 name = "herdr-oc-quota"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "GLM / Z.AI Coding Plan quota indicator for the Herdr tab bar"
 authors = ["Umar Alfarouk <medrivia@gmail.com>"]
@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 libc = "0.2"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde_json = "1"
 toml = "0.8"
 ureq = { version = "2", default-features = true }

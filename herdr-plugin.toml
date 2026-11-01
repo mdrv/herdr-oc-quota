@@ -1,6 +1,6 @@
 id = "herdr-oc-quota"
 name = "GLM / Z.AI Coding Plan Quota"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.8.2"
 description = "GLM / Z.AI Coding Plan quota indicator shown in the Herdr tab bar (top or bottom). Reads the API key from OpenCode's auth store; works without OpenCode running."
 platforms = ["linux"]

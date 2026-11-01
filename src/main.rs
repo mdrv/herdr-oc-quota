@@ -4,9 +4,10 @@
 //!   status            print ONE status line for tab_bar_right (fetches if stale)
 //!   refresh [--force] fetch now (blocking lock) and print the status line
 //!
-//! The Z.AI key is read from OpenCode's auth store
-//! (~/.local/share/opencode/auth.json, provider `zai-coding-plan`); OpenCode
-//! itself does not need to be running.
+//! The Z.AI key is read from OpenCode's credential store: the v2 credential
+//! DB (`~/.local/share/opencode/opencode.db`, `credential` table, read-only)
+//! first, legacy `auth.json` as fallback (provider `zai-coding-plan`);
+//! OpenCode itself does not need to be running.
 //!
 //! State:  ~/.local/state/herdr-oc-quota/state.json  (atomic tmp+rename writes)
 //! Config: ~/.config/herdr/oc-quota.toml (sibling of herdr's own config.toml)
@@ -32,6 +33,7 @@ struct Config {
     reset_style: String,
     show_age: bool,
     right_margin: String,
+    auth_db_path: Option<PathBuf>,
     auth_json_path: Option<PathBuf>,
 }
 
@@ -86,6 +88,24 @@ fn auth_json_path(cfg: &Config) -> PathBuf {
     home_path(".local/share/opencode/auth.json")
 }
 
+/// OpenCode v2 credential DB (SQLite, usually WAL-journaled). Read-only
+/// access; the `credential` table is tiny, so the point query never touches
+/// OpenCode's data tables.
+fn opencode_db_path(cfg: &Config) -> PathBuf {
+    if let Some(p) = std::env::var_os("HERDR_OC_QUOTA_AUTH_DB") {
+        return PathBuf::from(p);
+    }
+    if let Some(p) = &cfg.auth_db_path {
+        return p.clone();
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("opencode/opencode.db");
+        }
+    }
+    home_path(".local/share/opencode/opencode.db")
+}
+
 fn api_url() -> String {
     std::env::var("HERDR_OC_QUOTA_API_URL")
         .unwrap_or_else(|_| "https://api.z.ai/api/monitor/usage/quota/limit".to_string())
@@ -101,6 +121,7 @@ impl Config {
             reset_style: "clock".to_string(),
             show_age: true,
             right_margin: "\u{2800}".to_string(),
+            auth_db_path: None,
             auth_json_path: None,
         };
         let text = match fs::read_to_string(config_file()) {
@@ -155,6 +176,11 @@ impl Config {
         if let Some(v) = table.get("auth_json_path").and_then(toml::Value::as_str) {
             if !v.is_empty() {
                 cfg.auth_json_path = Some(PathBuf::from(v));
+            }
+        }
+        if let Some(v) = table.get("auth_db_path").and_then(toml::Value::as_str) {
+            if !v.is_empty() {
+                cfg.auth_db_path = Some(PathBuf::from(v));
             }
         }
         cfg
@@ -345,19 +371,96 @@ fn with_state_lock(blocking: bool, f: impl FnOnce()) {
 
 // ---------- fetch ----------
 
-fn read_api_key(cfg: &Config) -> Result<String, String> {
+/// The Z.AI API key from OpenCode's v2 credential DB. Returns `Ok(None)`
+/// when the DB is absent or has no usable row (caller falls back to
+/// auth.json); `Err` only when the DB exists but cannot be read.
+fn read_api_key_db(cfg: &Config) -> Result<Option<String>, String> {
+    use rusqlite::OptionalExtension;
+    let path = opencode_db_path(cfg);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("cannot read opencode.db: {e}"))?;
+    conn.busy_timeout(Duration::from_secs(2))
+        .map_err(|e| format!("cannot read opencode.db: {e}"))?;
+    // older builds named the column `connector_id` before `integration_id`
+    let icol = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(credential)")
+            .map_err(|e| format!("opencode.db: {e}"))?;
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(1))
+            .map_err(|e| format!("opencode.db: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("opencode.db: {e}"))?;
+        if names.iter().any(|c| c == "integration_id") {
+            "integration_id"
+        } else {
+            "connector_id"
+        }
+    };
+    // `active` is 1 on rows written by `opencode auth login`, but NULL on
+    // rows created by the one-time legacy auth.json import — treat NULL as
+    // active. `zai-coding-sleev` is an alias some configs use for the plan.
+    let sql = format!(
+        "SELECT value FROM credential WHERE {icol} IN (?1, ?2) \
+         AND (active IS NULL OR active != 0) \
+         ORDER BY ({icol} = ?1) DESC, time_updated DESC LIMIT 1"
+    );
+    let value: Option<String> = conn
+        .query_row(&sql, ["zai-coding-plan", "zai-coding-sleev"], |r| r.get(0))
+        .optional()
+        .map_err(|e| format!("opencode.db: {e}"))?;
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(None), // unusable row → try auth.json
+    };
+    // {"type":"key","key":…} for API keys; {"type":"oauth",…} for OAuth
+    let key = match parsed.get("type").and_then(Value::as_str) {
+        Some("oauth") => parsed
+            .get("access")
+            .and_then(Value::as_str)
+            .or_else(|| parsed.get("refresh").and_then(Value::as_str)),
+        _ => parsed.get("key").and_then(Value::as_str),
+    };
+    Ok(key.filter(|k| !k.is_empty()).map(str::to_string))
+}
+
+/// Legacy OpenCode < v2 store (still read as a fallback; the v2 migration
+/// imports it once but leaves the file in place).
+fn read_api_key_auth_json(cfg: &Config) -> Result<String, String> {
     let path = auth_json_path(cfg);
-    let text = fs::read_to_string(&path)
-        .map_err(|_| "cannot read OpenCode auth.json (log in via opencode once)".to_string())?;
+    let text =
+        fs::read_to_string(&path).map_err(|_| "cannot read OpenCode auth.json".to_string())?;
     let v: Value =
         serde_json::from_str(&text).map_err(|_| "auth.json is not valid JSON".to_string())?;
-    // NOTE: the key is never printed/logged.
     v.get("zai-coding-plan")
         .and_then(|p| p.get("key"))
         .and_then(Value::as_str)
         .filter(|k| !k.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "no zai-coding-plan key in auth.json".to_string())
+}
+
+fn read_api_key(cfg: &Config) -> Result<String, String> {
+    // OpenCode v2 credential DB first; legacy auth.json fallback. The key is
+    // never printed or logged.
+    let mut db_err = None;
+    match read_api_key_db(cfg) {
+        Ok(Some(key)) => return Ok(key),
+        Ok(None) => {}
+        Err(e) => db_err = Some(e),
+    }
+    read_api_key_auth_json(cfg).map_err(|_| {
+        db_err.unwrap_or_else(|| {
+            "no Z.AI credential in OpenCode (log in via opencode once)".to_string()
+        })
+    })
 }
 
 fn parse_and_store(body: &str) -> Result<(), String> {
