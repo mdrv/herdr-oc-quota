@@ -1,0 +1,101 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          # darwin x86_64 cross-compiles from the Apple Silicon runner via
+          # the shared SDK (macos-13 is retired); pin the deployment target
+          # to rustc's per-target minimums so binaries don't silently
+          # require a bleeding-edge macOS
+          - { os: macos-latest, target: aarch64-apple-darwin, dt: "11.0" }
+          - { os: macos-latest, target: x86_64-apple-darwin, dt: "10.12" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # ring's C code needs a musl cc when building the musl targets; each
+      # runner is host-native, so musl-gcc always matches the one target
+      # built there.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.dt || '11.0' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check version sync (tag == Cargo.toml == herdr-plugin.toml)
+        if: github.ref_type == 'tag'
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$V\"" Cargo.toml
+          grep -q "^version = \"$V\"" herdr-plugin.toml
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke the binary
+        run: |
+          EXE=""
+          case ${{ matrix.target }} in *windows*) EXE=.exe ;; esac
+          target/${{ matrix.target }}/release/herdr-oc-quota$EXE --version
+      - name: Package
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          T=${{ matrix.target }}
+          EXE=""
+          case $T in *windows*) EXE=.exe ;; esac
+          B=target/$T/release/herdr-oc-quota$EXE
+          D=herdr-oc-quota
+          mkdir -p pkg/$D
+          cp $B README.md LICENSE pkg/$D/
+          if [ -n "$EXE" ]; then
+            # bash's tar on windows runners is GNU tar: its -a ignores the
+            # .zip suffix and silently writes a plain tar — use the bsdtar
+            # at System32 and assert the zip magic before upload
+            /c/Windows/System32/tar.exe -a -cf herdr-oc-quota-v$V-$T.zip -C pkg $D
+            [ "$(head -c2 herdr-oc-quota-v$V-$T.zip)" = PK ] || { echo "not a zip"; exit 1; }
+          else
+            tar -czf herdr-oc-quota-v$V-$T.tar.gz -C pkg $D
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum herdr-oc-quota-v$V-$T.*; else shasum -a 256 herdr-oc-quota-v$V-$T.*; fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            herdr-oc-quota-*.tar.gz
+            herdr-oc-quota-*.zip
+
+  release:
+    # tag pushes only — workflow_dispatch runs are compile validation
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with: { merge-multiple: true, path: dist }
+      - name: Checksums
+        run: |
+          cd dist
+          ls | grep -v '^SHA256SUMS.txt$' | xargs sha256sum > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true

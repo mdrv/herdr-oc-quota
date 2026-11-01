@@ -16,7 +16,6 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::exit;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,7 +36,8 @@ struct Config {
 }
 
 fn home_path(rel: &str) -> PathBuf {
-    let home = std::env::var_os("HOME")
+    let home = std::env::var_os("HOME") // unix
+        .or_else(|| std::env::var_os("USERPROFILE")) // windows
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(rel)
@@ -185,13 +185,29 @@ fn fmt_dur(s: i64) -> String {
     }
 }
 
-/// Local wall-clock time `HH:mm:ss` for an epoch instant (honors $TZ).
+/// Local wall-clock time `HH:mm:ss` for an epoch instant (honors $TZ on unix;
+/// uses the system timezone on windows).
+#[cfg(unix)]
 fn fmt_local_hms(epoch_s: i64) -> String {
     let t = epoch_s as libc::time_t;
     // SAFETY: localtime_r writes into `tm`, returning NULL only on failure.
     let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
+            return "??:??:??".to_string();
+        }
+        tm
+    };
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+#[cfg(windows)]
+fn fmt_local_hms(epoch_s: i64) -> String {
+    let t = epoch_s as libc::time_t;
+    // SAFETY: localtime_s writes into `tm`, returning nonzero only on failure.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_s(&mut tm, &t) != 0 {
             return "??:??:??".to_string();
         }
         tm
@@ -277,10 +293,20 @@ fn store_error(msg: &str) {
     write_state(&st);
 }
 
-// ---------- locking (flock) ----------
+// ---------- locking ----------
+// Advisory exclusive non-blocking lock over the state "lock" file, so
+// concurrent status/refresh processes serialize (flock on unix, LockFileEx
+// via std's file-locking API on windows).
 
+#[cfg(unix)]
 fn try_flock(file: &fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[cfg(windows)]
+fn try_flock(file: &fs::File) -> bool {
+    file.try_lock().is_ok()
 }
 
 fn with_state_lock(blocking: bool, f: impl FnOnce()) {
@@ -484,7 +510,7 @@ fn cmd_refresh(force: bool) {
 }
 
 fn usage() {
-    println!("usage: herdr-oc-quota status | refresh [--force]");
+    println!("usage: herdr-oc-quota status | refresh [--force] | --version");
 }
 
 fn main() {
@@ -492,6 +518,9 @@ fn main() {
     match args.first().map(String::as_str) {
         None | Some("status") => cmd_status(),
         Some("refresh") => cmd_refresh(args.get(1).map(String::as_str) == Some("--force")),
+        Some("-V") | Some("--version") | Some("version") => {
+            println!("herdr-oc-quota {}", env!("CARGO_PKG_VERSION"));
+        }
         Some("-h") | Some("--help") | Some("help") => usage(),
         Some(other) => {
             eprintln!("herdr-oc-quota: unknown command: {other}");

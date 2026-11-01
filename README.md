@@ -1,5 +1,15 @@
 # herdr-oc-quota
 
+> [!CAUTION]
+> **Personal software, maintained for the author only.** The repo is public so
+> the CI, release pipeline, and Arch package have a home, not because it is a
+> supported product. Development is heavily LLM-assisted: most commits are
+> written with AI agents and verified only against the author's own setup
+> (herdr on Linux, a single GLM / Z.AI Coding Plan). Expect breaking changes
+> at any bump, no support, no stability guarantee, no release schedule. Read
+> it as a reference for your own herdr plugin; if you want a supported quota
+> indicator, use `oc-quota` directly.
+
 GLM / Z.AI Coding Plan quota indicator for [Herdr](https://herdr.dev), tucked
 into the **tab bar** (top or bottom — wherever yours lives) — always visible,
 not tied to any pane or agent sidebar item.
@@ -23,8 +33,41 @@ not tied to any pane or agent sidebar item.
 
 ## Install
 
+### Arch Linux (personal `mdrv` repo, aarch64 + x86_64)
+
+```ini
+# /etc/pacman.conf
+[mdrv]
+SigLevel = Optional TrustAll
+Server = https://mdrv.github.io/alarm/x86_64    # or .../aarch64
+```
+
 ```sh
-git clone …/herdr-oc-quota && cd herdr-oc-quota   # or this directory
+sudo pacman -Syu herdr-oc-quota
+```
+
+The package installs the static `/usr/bin/herdr-oc-quota`; point herdr at it
+in `~/.config/herdr/config.toml`:
+
+```toml
+[ui]
+tab_bar_right = [
+	{ type = "command", command = "/usr/bin/herdr-oc-quota status", interval_seconds = 30, timeout_seconds = 25 },
+]
+```
+
+### Prebuilt binaries (GitHub Releases)
+
+[Releases](https://github.com/mdrv/herdr-oc-quota/releases) carry static
+tarballs for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+`aarch64-apple-darwin`, `x86_64-apple-darwin`, and a `.zip` for
+`x86_64-pc-windows-msvc` (+ `SHA256SUMS.txt`). Drop the binary on `PATH`
+(e.g. `/usr/local/bin`) and add the `tab_bar_right` line above.
+
+### From source (full plugin)
+
+```sh
+git clone https://github.com/mdrv/herdr-oc-quota && cd herdr-oc-quota
 ./install.sh
 ```
 
@@ -68,6 +111,10 @@ Restores your previous tab bar settings, unlinks the plugin, removes state
   herdr plugin action invoke herdr-oc-quota.refresh
   ```
 - The plugin also refreshes once on Herdr startup (`[[startup]]`).
+
+The palette action and startup refresh come from the linked plugin manifest
+(from-source install). With a packaged binary, run
+`herdr-oc-quota refresh --force` from a shell instead.
 
 ## Status line
 
